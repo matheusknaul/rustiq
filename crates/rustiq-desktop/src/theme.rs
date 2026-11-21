@@ -126,3 +126,24 @@ pub fn method_color(method: &str) -> Color {
         _ => MAUVE,
     }
 }
+
+pub fn editor(
+    _: &Theme,
+    status: iced::widget::text_editor::Status,
+) -> iced::widget::text_editor::Style {
+    iced::widget::text_editor::Style {
+        background: MANTLE.into(),
+        border: Border {
+            color: if matches!(status, iced::widget::text_editor::Status::Focused { .. }) {
+                BLUE
+            } else {
+                BORDER
+            },
+            width: 1.,
+            radius: 3.into(),
+        },
+        placeholder: MUTED,
+        value: TEXT,
+        selection: SURFACE,
+    }
+}

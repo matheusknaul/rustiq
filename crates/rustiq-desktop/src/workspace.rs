@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::Path};
+use std::{
+    fs,
+    io::{self, Write},
+    path::Path,
+};
 
 pub type Id = u64;
 
@@ -19,6 +23,8 @@ pub struct Entry {
     pub method: String,
     pub url: String,
     pub expanded: bool,
+    #[serde(default)]
+    pub request: rustiq_http::RequestOptions,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -68,6 +74,7 @@ impl Workspace {
             method: "GET".into(),
             url: String::new(),
             expanded: true,
+            request: rustiq_http::RequestOptions::default(),
         });
         Some(id)
     }
@@ -144,7 +151,23 @@ impl Workspace {
         }
         let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, data).map_err(|e| e.to_string())?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        file.write_all(&data).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
         fs::rename(temporary, path).map_err(|e| e.to_string())
     }
 }
@@ -189,11 +212,44 @@ mod tests {
             .create(Kind::Request, Some(collection), "Users")
             .unwrap();
         workspace.entry_mut(request).unwrap().url = "https://example.com/users".into();
+        workspace.entry_mut(request).unwrap().request.body.text = "{\"ok\":true}".into();
+        workspace.entry_mut(request).unwrap().request.auth.kind = rustiq_http::AuthKind::Bearer;
+        workspace.entry_mut(request).unwrap().request.auth.token = "saved-token".into();
         workspace.save(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let loaded = Workspace::load(&path).unwrap();
+        assert_eq!(
+            loaded.entry(request).unwrap().request.auth.token,
+            "saved-token"
+        );
+        assert_eq!(
+            loaded.entry(request).unwrap().request.body.text,
+            "{\"ok\":true}"
+        );
         assert_eq!(
             loaded.entry(request).unwrap().url,
             "https://example.com/users"
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        for entry in legacy["entries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("request");
+        }
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            Workspace::load(&path)
+                .unwrap()
+                .entry(request)
+                .unwrap()
+                .request
+                .params
+                .is_empty()
         );
         fs::write(&path, b"invalid json").unwrap();
         assert!(Workspace::load(&path).is_err());

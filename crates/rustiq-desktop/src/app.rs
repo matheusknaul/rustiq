@@ -1,3 +1,4 @@
+use crate::details::{Details, Response};
 use crate::{
     message::Message,
     workspace::{Id, Kind, Workspace},
@@ -8,15 +9,8 @@ use iced::{
     widget::{button, column, container, pick_list, row, scrollable, text, text_input},
 };
 use reqwest::Method;
-use rustiq_http::send_request;
+use rustiq_http::send_request_with_options;
 use std::{collections::HashMap, path::PathBuf};
-
-#[derive(Default)]
-struct Response {
-    loading: bool,
-    status: Option<u16>,
-    body: String,
-}
 
 enum Dialog {
     Name {
@@ -30,6 +24,7 @@ enum Dialog {
 
 pub struct App {
     workspace: Workspace,
+    details: Details,
     selected: Option<Id>,
     responses: HashMap<Id, Response>,
     dialog: Option<Dialog>,
@@ -55,6 +50,7 @@ impl Default for App {
         let storage_ready = storage_error.is_none();
         Self {
             workspace,
+            details: Details::default(),
             selected: None,
             responses: HashMap::new(),
             dialog: None,
@@ -78,8 +74,20 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Edit(edit) => {
+                if let Some(entry) = self.selected.and_then(|id| self.workspace.entry_mut(id)) {
+                    let (task, changed) =
+                        self.details
+                            .update(edit, entry, self.responses.get_mut(&entry.id));
+                    if changed {
+                        self.persist();
+                    }
+                    return task;
+                }
+            }
             Message::Select(id) => {
                 self.selected = Some(id);
+                self.details.select(self.workspace.entry(id));
             }
             Message::Toggle(id) => {
                 if let Some(entry) = self.workspace.entry_mut(id) {
@@ -147,6 +155,8 @@ impl App {
                             self.workspace.rename(id, &value);
                         } else {
                             self.selected = self.workspace.create(kind, parent, &value);
+                            self.details
+                                .select(self.selected.and_then(|id| self.workspace.entry(id)));
                         }
                         self.persist();
                     }
@@ -195,24 +205,16 @@ impl App {
                 };
                 let url = entry.url.clone();
                 let method = entry.method.parse().unwrap_or(Method::GET);
+                let options = entry.request.clone();
                 return Task::perform(
-                    async move { send_request(&url, method).await.map_err(|e| e.to_string()) },
+                    async move { send_request_with_options(&url, method, options).await },
                     move |result| Message::RequestFinished(id, result),
                 );
             }
             Message::RequestFinished(id, result) => {
                 if self.workspace.entry(id).is_some() {
                     let response = self.responses.entry(id).or_default();
-                    response.loading = false;
-                    match result {
-                        Ok(result) => {
-                            response.status = Some(result.status);
-                            response.body = result.body;
-                        }
-                        Err(error) => {
-                            response.body = format!("Error: {error}");
-                        }
-                    }
+                    response.complete(result);
                 }
             }
         }
@@ -450,73 +452,18 @@ impl App {
                     .style(theme::panel),
                 );
 
-                let (status, color) = match response {
-                    Some(r) if r.loading => ("IN FLIGHT".into(), theme::YELLOW),
-                    Some(r) if r.status.is_some() => {
-                        let code = r.status.unwrap();
-                        (
-                            format!("HTTP {code}"),
-                            if code < 400 { theme::GREEN } else { theme::RED },
-                        )
-                    }
-                    Some(r) if !r.body.is_empty() => ("REQUEST FAILED".into(), theme::RED),
-                    _ => ("IDLE".into(), theme::MUTED),
-                };
-                let mut response_panel = column![
-                    container(
-                        row![
-                            ui::icon(ui::TERMINAL, theme::BLUE),
-                            text("RESPONSE").size(12).color(theme::BLUE),
-                            iced::widget::Space::new().width(Fill),
-                            text(status).size(12).color(color),
-                            text(format!("{} B", response.map_or(0, |r| r.body.len())))
-                                .size(12)
-                                .color(theme::MUTED)
-                        ]
-                        .spacing(12)
-                        .align_y(iced::Center)
+                content = content
+                    .push(
+                        container(self.details.request_view(entry))
+                            .height(iced::Length::FillPortion(1)),
                     )
-                    .padding([12, 16])
-                    .width(Fill)
-                    .style(theme::bar),
-                    iced::widget::rule::horizontal(1),
-                ]
-                .height(Fill);
-                if let Some(r) = response.filter(|r| !r.body.is_empty()) {
-                    response_panel = response_panel.push(
-                        scrollable(container(text(&r.body).size(13)).padding(16)).height(Fill),
+                    .push(
+                        container(self.details.response_view(response))
+                            .height(iced::Length::FillPortion(1)),
                     );
-                } else {
-                    response_panel = response_panel.push(
-                        container(
-                            column![
-                                text(if loading {
-                                    "$ sending request_"
-                                } else {
-                                    "$ awaiting response_"
-                                })
-                                .size(18)
-                                .color(theme::BLUE),
-                                text(if loading {
-                                    "Connecting to the API. Hang tight."
-                                } else {
-                                    "Send a request to inspect its status and response body."
-                                })
-                                .size(12)
-                                .color(theme::MUTED),
-                            ]
-                            .spacing(12),
-                        )
-                        .center_x(Fill)
-                        .center_y(Fill),
-                    );
+                if let Some(notice) = &self.details.notice {
+                    content = content.push(text(notice).size(11).color(theme::YELLOW));
                 }
-                content = content.push(
-                    container(response_panel)
-                        .width(Fill)
-                        .height(Fill)
-                        .style(theme::inset),
-                );
             } else {
                 let children: Vec<_> = self
                     .workspace
@@ -792,6 +739,7 @@ mod tests {
             .unwrap();
         let mut app = App {
             workspace,
+            details: Details::default(),
             selected: Some(first),
             responses: HashMap::new(),
             dialog: None,
@@ -807,6 +755,7 @@ mod tests {
             Ok(rustiq_http::HttpResponse {
                 status: 201,
                 body: "created".into(),
+                ..Default::default()
             }),
         ));
         assert_eq!(app.workspace.entry(first).unwrap().method, "POST");
