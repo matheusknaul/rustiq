@@ -311,3 +311,17 @@ async fn multipart_fields_are_sent_with_the_matching_boundary() {
     assert!(raw.contains(&format!("--{boundary}\r\n")));
     assert!(raw.contains("name=\"field\"\r\n\r\nhello multipart"));
 }
+
+#[test]
+fn secret_values_are_not_exposed_by_debug_output() {
+    let mut options = RequestOptions::default();
+    options.auth.token = "token-secret".into();
+    options.headers.push(pair("secret-header", "header-secret"));
+    options.body.text = "body-secret".into();
+    assert!(!format!("{options:?}").contains("-secret"));
+    let response = HttpResponse {
+        body: "response-secret".into(),
+        ..Default::default()
+    };
+    assert!(!format!("{response:?}").contains("response-secret"));
+}

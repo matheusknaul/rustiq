@@ -1,6 +1,7 @@
 mod app;
 mod details;
 mod message;
+mod storage;
 mod theme;
 mod ui;
 mod workspace;

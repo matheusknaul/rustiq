@@ -1,4 +1,5 @@
 use crate::details::{Details, Response};
+use crate::storage::{NativeKeyStore, Storage, workspace_path};
 use crate::{
     message::Message,
     workspace::{Id, Kind, Workspace},
@@ -20,6 +21,7 @@ enum Dialog {
         value: String,
     },
     Delete(Id),
+    LockWorkspace,
 }
 
 pub struct App {
@@ -27,53 +29,109 @@ pub struct App {
     details: Details,
     selected: Option<Id>,
     responses: HashMap<Id, Response>,
+    pending: HashMap<Id, iced::task::Handle>,
     dialog: Option<Dialog>,
     path: PathBuf,
     storage_error: Option<String>,
-    storage_ready: bool,
+    storage: Option<Storage>,
+    locked: bool,
+    temporary: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let path = base.join("rustiq/workspace.json");
-        let (workspace, storage_error) = match Workspace::load(&path) {
-            Ok(workspace) => (workspace, None),
-            Err(error) => (
-                Workspace::default(),
-                Some(format!("Could not load {}: {error}", path.display())),
-            ),
-        };
-        let storage_ready = storage_error.is_none();
+        let location = workspace_path();
+        let path = location.as_ref().cloned().unwrap_or_default();
+        let (storage, workspace, storage_error) =
+            match location.and_then(|path| Storage::open(path, NativeKeyStore)) {
+                Ok((storage, workspace)) => (Some(storage), workspace, None),
+                Err(error) => (None, Workspace::default(), Some(error)),
+            };
+        let storage_ready = storage.is_some();
         Self {
             workspace,
             details: Details::default(),
             selected: None,
             responses: HashMap::new(),
+            pending: HashMap::new(),
             dialog: None,
             path,
             storage_error,
-            storage_ready,
+            storage,
+            locked: !storage_ready,
+            temporary: false,
         }
     }
 }
 
 impl App {
     fn persist(&mut self) {
-        if self.storage_ready {
-            self.storage_error = self
-                .workspace
-                .save(&self.path)
-                .err()
-                .map(|e| format!("Could not save workspace: {e}"));
+        if let Some(storage) = &mut self.storage {
+            self.storage_error = storage.save(&self.workspace).err();
         }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if self.locked
+            && !matches!(
+                message,
+                Message::RetryStorage | Message::UseTemporaryWorkspace
+            )
+        {
+            return Task::none();
+        }
         match message {
+            Message::LockWorkspace => {
+                if !self.temporary && self.storage_error.is_none() {
+                    self.dialog = Some(Dialog::LockWorkspace);
+                }
+            }
+            Message::ConfirmLock => {
+                if matches!(self.dialog, Some(Dialog::LockWorkspace)) {
+                    for handle in self.pending.values() {
+                        handle.abort();
+                    }
+                    self.pending.clear();
+                    self.workspace = Workspace::default();
+                    self.details = Details::default();
+                    self.responses.clear();
+                    self.selected = None;
+                    self.dialog = None;
+                    self.storage = None; // Drops the zeroizing cached encryption key.
+                    self.locked = true;
+                    self.storage_error = None;
+                }
+            }
+            Message::RetryStorage => {
+                if self.locked {
+                    let location = if self.path.as_os_str().is_empty() {
+                        workspace_path()
+                    } else {
+                        Ok(self.path.clone())
+                    };
+                    match location.and_then(|path| {
+                        Storage::open(path.clone(), NativeKeyStore).map(|result| (path, result))
+                    }) {
+                        Ok((path, (storage, workspace))) => {
+                            self.path = path;
+                            self.storage = Some(storage);
+                            self.workspace = workspace;
+                            self.locked = false;
+                            self.storage_error = None;
+                        }
+                        Err(error) => self.storage_error = Some(error),
+                    }
+                } else {
+                    self.persist();
+                }
+            }
+            Message::UseTemporaryWorkspace => {
+                // Detach from disk entirely. The saved workspace is never overwritten.
+                self.storage = None;
+                self.locked = false;
+                self.temporary = true;
+                self.storage_error = None;
+            }
             Message::Edit(edit) => {
                 if let Some(entry) = self.selected.and_then(|id| self.workspace.entry_mut(id)) {
                     let (task, changed) =
@@ -171,6 +229,14 @@ impl App {
                     self.workspace.remove(id);
                     self.responses
                         .retain(|id, _| self.workspace.entry(*id).is_some());
+                    self.pending.retain(|id, handle| {
+                        if self.workspace.entry(*id).is_none() {
+                            handle.abort();
+                            false
+                        } else {
+                            true
+                        }
+                    });
                     self.selected = None;
                     self.persist();
                 }
@@ -206,12 +272,16 @@ impl App {
                 let url = entry.url.clone();
                 let method = entry.method.parse().unwrap_or(Method::GET);
                 let options = entry.request.clone();
-                return Task::perform(
+                let (task, handle) = Task::perform(
                     async move { send_request_with_options(&url, method, options).await },
                     move |result| Message::RequestFinished(id, result),
-                );
+                )
+                .abortable();
+                self.pending.insert(id, handle.abort_on_drop());
+                return task;
             }
             Message::RequestFinished(id, result) => {
+                self.pending.remove(&id);
                 if self.workspace.entry(id).is_some() {
                     let response = self.responses.entry(id).or_default();
                     response.complete(result);
@@ -310,6 +380,16 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        if self.locked {
+            return container(container(column![
+                ui::label(ui::LOCK, "Workspace locked", theme::BLUE),
+                text("Unlock your OS credential store and retry. Your saved data remains on disk.").size(14),
+                text(self.storage_error.as_deref().unwrap_or("Could not open secure storage")).size(12).color(theme::YELLOW),
+                row![button("Retry unlock").on_press(Message::RetryStorage).padding(10).style(theme::primary),
+                    button("Use temporary workspace").on_press(Message::UseTemporaryWorkspace).padding(10).style(theme::control)].spacing(10),
+                text("Temporary workspaces stay in memory and do not change your saved data.").size(11).color(theme::MUTED),
+            ].spacing(18)).padding(24).max_width(680).style(theme::panel)).center_x(Fill).center_y(Fill).into();
+        }
         let collection_count = self
             .workspace
             .entries
@@ -369,6 +449,9 @@ impl App {
             );
 
         let mut content = column![].spacing(16).padding(22).width(Fill).height(Fill);
+        if self.temporary {
+            content = content.push(text("SESSION ONLY — nothing in this workspace will be saved. Restart to reopen your saved workspace.").size(11).color(theme::YELLOW));
+        }
         if let Some(entry) = self.selected.and_then(|id| self.workspace.entry(id)) {
             content = content
                 .push(
@@ -454,7 +537,7 @@ impl App {
 
                 content = content
                     .push(
-                        container(self.details.request_view(entry))
+                        container(self.details.request_view(entry, self.temporary))
                             .height(iced::Length::FillPortion(1)),
                     )
                     .push(
@@ -561,7 +644,27 @@ impl App {
             ].spacing(24)).center_x(Fill).center_y(Fill).style(theme::panel));
         }
         if let Some(error) = &self.storage_error {
-            content = content.push(text(error).size(12).color(theme::RED));
+            content = content.push(
+                column![
+                    text(error).size(12).color(theme::RED),
+                    row![
+                        button("Retry save")
+                            .on_press(Message::RetryStorage)
+                            .style(theme::control),
+                        button("Keep this session in memory")
+                            .on_press(Message::UseTemporaryWorkspace)
+                            .style(theme::control)
+                    ]
+                    .spacing(8)
+                ]
+                .spacing(6),
+            );
+        }
+        let mut lock_button = button(ui::label(ui::LOCK, "Lock", theme::BLUE))
+            .padding([6, 10])
+            .style(theme::control);
+        if !self.temporary && self.storage_error.is_none() {
+            lock_button = lock_button.on_press(Message::LockWorkspace);
         }
         let header = container(
             row![
@@ -569,6 +672,7 @@ impl App {
                 text("RustiQ").size(18).color(theme::BLUE),
                 text("/ API WORKSPACE").size(11).color(theme::MUTED),
                 iced::widget::Space::new().width(Fill),
+                lock_button,
                 ui::icon(ui::CODE, theme::GREEN),
                 text("100% open source").size(11).color(theme::MUTED)
             ]
@@ -595,7 +699,11 @@ impl App {
                 text(if self.storage_error.is_some() {
                     "Storage error"
                 } else {
-                    "Local workspace"
+                    if self.temporary {
+                        "Session only"
+                    } else {
+                        "Encrypted workspace"
+                    }
                 })
                 .size(11)
                 .color(theme::MUTED),
@@ -629,6 +737,11 @@ impl App {
 
         if let Some(dialog) = &self.dialog {
             let panel: Element<'_, Message> = match dialog {
+                Dialog::LockWorkspace => column![
+                    ui::label(ui::LOCK, "Lock workspace?", theme::BLUE),
+                    text("Saved requests stay encrypted. Session-only configuration and responses will be discarded.").size(13),
+                    row![button("Cancel").on_press(Message::CancelDialog).padding(10).style(theme::control), button("Lock").on_press(Message::ConfirmLock).padding(10).style(theme::primary)].spacing(10)
+                ].spacing(18).into(),
                 Dialog::Name {
                     id,
                     kind,
@@ -727,6 +840,60 @@ impl App {
 mod tests {
     use super::*;
 
+    fn session_app() -> App {
+        App {
+            workspace: Workspace::default(),
+            details: Details::default(),
+            selected: None,
+            responses: HashMap::new(),
+            pending: HashMap::new(),
+            dialog: None,
+            path: PathBuf::new(),
+            storage_error: None,
+            storage: None,
+            locked: false,
+            temporary: true,
+        }
+    }
+    #[test]
+    fn locking_blocks_edits_and_discards_session_configuration() {
+        let mut app = session_app();
+        app.temporary = false;
+        let collection = app.workspace.create(Kind::Collection, None, "API").unwrap();
+        let id = app
+            .workspace
+            .create(Kind::Request, Some(collection), "Request")
+            .unwrap();
+        app.workspace.entry_mut(id).unwrap().request.auth.token = "private-token".into();
+        app.selected = Some(id);
+        let _ = app.update(Message::LockWorkspace);
+        assert!(!app.workspace.entries.is_empty());
+        let _ = app.update(Message::ConfirmLock);
+        assert!(app.workspace.entries.is_empty());
+        assert!(app.locked);
+        let _ = app.view();
+        let _ = app.update(Message::Create(Kind::Collection));
+        assert!(app.dialog.is_none());
+        let _ = app.update(Message::UseTemporaryWorkspace);
+        assert!(!app.locked);
+        assert!(app.temporary);
+        let _ = app.update(Message::Create(Kind::Collection));
+        assert!(app.dialog.is_some());
+    }
+    #[test]
+    fn debug_messages_redact_secrets() {
+        for message in [
+            Message::UrlChanged("url-secret".into()),
+            Message::Edit(crate::details::Edit::AuthField(
+                crate::details::AuthField::Token,
+                "token-secret".into(),
+            )),
+            Message::NameChanged("name-secret".into()),
+        ] {
+            assert!(!format!("{message:?}").contains("-secret"));
+        }
+    }
+
     #[test]
     fn edits_and_async_responses_stay_with_their_request() {
         let mut workspace = Workspace::default();
@@ -742,10 +909,13 @@ mod tests {
             details: Details::default(),
             selected: Some(first),
             responses: HashMap::new(),
+            pending: HashMap::new(),
             dialog: None,
             path: PathBuf::new(),
             storage_error: None,
-            storage_ready: false,
+            storage: None,
+            locked: false,
+            temporary: false,
         };
         let _ = app.update(Message::UrlChanged("https://example.com/first".into()));
         let _ = app.update(Message::MethodChanged(Method::POST));

@@ -1,4 +1,8 @@
-use crate::{message::Message, theme, ui, workspace::Entry};
+use crate::{
+    message::Message,
+    theme, ui,
+    workspace::{Entry, Persistence},
+};
 use iced::{
     Element, Fill, Task,
     widget::{
@@ -43,8 +47,9 @@ pub enum AuthField {
     ClientSecret,
     Scope,
 }
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Edit {
+    Persistence(bool),
     RequestTab(RequestTab),
     ResponseTab(ResponseTab),
     Add(Table),
@@ -127,6 +132,13 @@ impl Details {
         let mut changed = true;
         self.notice = None;
         match edit {
+            Edit::Persistence(persist) => {
+                entry.persistence = if persist {
+                    Persistence::Encrypted
+                } else {
+                    Persistence::SessionOnly
+                }
+            }
             Edit::RequestTab(tab) => {
                 self.request_tab = tab;
                 changed = false;
@@ -183,10 +195,10 @@ impl Details {
                 }
             }
             Edit::ResponseBody(action) => {
-                if !action.is_edit() {
-                    if let Some(response) = response {
-                        response.editor.perform(action);
-                    }
+                if !action.is_edit()
+                    && let Some(response) = response
+                {
+                    response.editor.perform(action);
                 }
                 changed = false;
             }
@@ -238,11 +250,11 @@ impl Details {
                 changed = false;
             }
             Edit::RawResponse => {
-                if let Some(response) = response {
-                    if let Some(data) = &response.data {
-                        response.body = data.body.clone();
-                        response.editor = text_editor::Content::with_text(&response.body);
-                    }
+                if let Some(response) = response
+                    && let Some(data) = &response.data
+                {
+                    response.body = data.body.clone();
+                    response.editor = text_editor::Content::with_text(&response.body);
                 }
                 changed = false;
             }
@@ -265,7 +277,7 @@ impl Details {
         (Task::none(), changed)
     }
 
-    pub fn request_view<'a>(&'a self, entry: &'a Entry) -> Element<'a, Message> {
+    pub fn request_view<'a>(&'a self, entry: &'a Entry, temporary: bool) -> Element<'a, Message> {
         let options = &entry.request;
         let tabs = row![
             tab(
@@ -418,7 +430,9 @@ impl Details {
                     }
                 }
                 if auth.kind != AuthKind::None {
-                    fields = fields.push(hint("Credentials are saved locally with this request."));
+                    fields = fields.push(hint(if temporary || entry.persistence == Persistence::SessionOnly {
+                        "Session only: request configuration is not saved."
+                    } else { "Request configuration is encrypted with a key held in the OS credential store." }));
                 }
                 scrollable(fields).height(Fill).into()
             }
@@ -456,12 +470,38 @@ impl Details {
                 body.into()
             }
         };
-        container(column![tabs, iced::widget::rule::horizontal(1), body].spacing(10))
-            .padding(12)
-            .width(Fill)
-            .height(Fill)
-            .style(theme::panel)
-            .into()
+        let mut save = checkbox(!temporary && entry.persistence == Persistence::Encrypted)
+            .label(if temporary {
+                "Session-only workspace: nothing is saved"
+            } else {
+                "Save request configuration encrypted"
+            })
+            .text_size(11);
+        if !temporary {
+            save = save.on_toggle(|persist| Message::Edit(Edit::Persistence(persist)));
+        }
+        let storage_note = if temporary || entry.persistence == Persistence::SessionOnly {
+            "Session only: URL and request fields are discarded on close or lock."
+        } else {
+            "URL and request fields are encrypted; item names and HTTP methods remain visible."
+        };
+        container(
+            column![
+                row![ui::icon(ui::LOCK, theme::GREEN), save]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                hint(storage_note),
+                tabs,
+                iced::widget::rule::horizontal(1),
+                body
+            ]
+            .spacing(10),
+        )
+        .padding(12)
+        .width(Fill)
+        .height(Fill)
+        .style(theme::panel)
+        .into()
     }
 
     pub fn response_view<'a>(&'a self, response: Option<&'a Response>) -> Element<'a, Message> {
@@ -707,6 +747,12 @@ fn table_view<'a>(pairs: &'a [Pair], table: Table, description: &'a str) -> Elem
     }
     rows = rows.push(action(ui::PLUS, "Add row", Edit::Add(table)));
     scrollable(rows).height(Fill).into()
+}
+
+impl std::fmt::Debug for Edit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RequestEdit(<redacted>)")
+    }
 }
 
 #[cfg(test)]

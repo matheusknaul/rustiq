@@ -6,7 +6,7 @@ use reqwest::{
 };
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResponseCookie {
     pub name: String,
     pub value: String,
@@ -18,7 +18,7 @@ pub struct ResponseCookie {
     pub same_site: String,
     pub raw: String,
 }
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
@@ -301,3 +301,18 @@ pub async fn send_request(url: &str, method: Method) -> Result<HttpResponse, Str
 
 #[cfg(test)]
 mod tests;
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("size", &self.size)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for ResponseCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResponseCookie(<redacted>)")
+    }
+}
