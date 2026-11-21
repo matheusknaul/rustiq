@@ -1,0 +1,10 @@
+[package]
+name = "rustiq-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.9", features = ["derive"] }
+reqwest = "0.13.5"
+rustiq-http = { version = "0.1.0", path = "../rustiq-http" }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }

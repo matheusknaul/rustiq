@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/rustiq-core",
+    "crates/rustiq-http",
+    "crates/rustiq-cli",
+    "crates/rustiq-desktop",
+]
