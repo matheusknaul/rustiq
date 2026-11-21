@@ -4,6 +4,7 @@ use rustiq_http::HttpResponse;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Edit(crate::details::Edit),
     UrlChanged(String),
     MethodChanged(Method),
     SendRequest,

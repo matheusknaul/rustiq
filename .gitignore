@@ -32,3 +32,6 @@ Thumbs.db
 Desktop.ini
 
 # Keep Cargo.lock versioned: this workspace includes applications.
+
+# Local UI references
+/ui-inspiration/

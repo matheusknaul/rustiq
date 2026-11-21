@@ -1,4 +1,5 @@
 mod app;
+mod details;
 mod message;
 mod theme;
 mod ui;
