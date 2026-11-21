@@ -1,9 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::{self, Write},
-    path::Path,
-};
 
 pub type Id = u64;
 
@@ -14,7 +9,16 @@ pub enum Kind {
     Request,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Persistence {
+    #[default]
+    Encrypted,
+    SessionOnly,
+}
+
+// Runtime data must only be serialized through the encrypted storage layer.
+#[derive(Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct Entry {
     pub id: Id,
     pub parent: Option<Id>,
@@ -25,13 +29,17 @@ pub struct Entry {
     pub expanded: bool,
     #[serde(default)]
     pub request: rustiq_http::RequestOptions,
+    #[serde(default)]
+    pub persistence: Persistence,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(deny_unknown_fields)]
 pub struct Workspace {
     pub entries: Vec<Entry>,
     #[serde(default)]
-    next_id: Id,
+    pub(super) next_id: Id,
 }
 
 impl Workspace {
@@ -75,6 +83,7 @@ impl Workspace {
             url: String::new(),
             expanded: true,
             request: rustiq_http::RequestOptions::default(),
+            persistence: Persistence::Encrypted,
         });
         Some(id)
     }
@@ -107,21 +116,10 @@ impl Workspace {
         self.entries.retain(|e| !ids.contains(&e.id));
     }
 
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let data = match fs::read(path) {
-            Ok(data) => data,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error.to_string()),
-        };
-        let workspace: Self = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
+    pub fn validate(&self) -> Result<(), String> {
         // Reject invalid references, duplicate IDs and cycles before rendering the tree.
-        for entry in &workspace.entries {
-            if workspace
-                .entries
-                .iter()
-                .filter(|e| e.id == entry.id)
-                .count()
-                != 1
+        for entry in &self.entries {
+            if self.entries.iter().filter(|e| e.id == entry.id).count() != 1
                 || entry.name.trim().is_empty()
                 || entry.method.parse::<reqwest::Method>().is_err()
                 || (entry.kind == Kind::Collection) != entry.parent.is_none()
@@ -135,40 +133,31 @@ impl Workspace {
                     return Err("Workspace contains a cycle".into());
                 }
                 ancestors.push(id);
-                let node = workspace.entry(id).ok_or("Workspace parent is missing")?;
+                let node = self.entry(id).ok_or("Workspace parent is missing")?;
                 if node.kind == Kind::Request {
                     return Err("Requests cannot contain entries".into());
                 }
                 parent = node.parent;
             }
         }
-        Ok(workspace)
+        Ok(())
     }
+}
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        let temporary = path.with_extension("json.tmp");
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
-        }
-        file.write_all(&data).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        drop(file);
-        fs::rename(temporary, path).map_err(|e| e.to_string())
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("persistence", &self.persistence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.url.zeroize();
     }
 }
 
@@ -201,58 +190,5 @@ mod tests {
         workspace.remove(folder);
         assert_eq!(workspace.entries.len(), 1);
         assert_eq!(workspace.entries[0].name, "API");
-    }
-
-    #[test]
-    fn persistence_round_trip() {
-        let path = std::env::temp_dir().join(format!("rustiq-test-{}.json", std::process::id()));
-        let mut workspace = Workspace::default();
-        let collection = workspace.create(Kind::Collection, None, "API").unwrap();
-        let request = workspace
-            .create(Kind::Request, Some(collection), "Users")
-            .unwrap();
-        workspace.entry_mut(request).unwrap().url = "https://example.com/users".into();
-        workspace.entry_mut(request).unwrap().request.body.text = "{\"ok\":true}".into();
-        workspace.entry_mut(request).unwrap().request.auth.kind = rustiq_http::AuthKind::Bearer;
-        workspace.entry_mut(request).unwrap().request.auth.token = "saved-token".into();
-        workspace.save(&path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-        let loaded = Workspace::load(&path).unwrap();
-        assert_eq!(
-            loaded.entry(request).unwrap().request.auth.token,
-            "saved-token"
-        );
-        assert_eq!(
-            loaded.entry(request).unwrap().request.body.text,
-            "{\"ok\":true}"
-        );
-        assert_eq!(
-            loaded.entry(request).unwrap().url,
-            "https://example.com/users"
-        );
-        let mut legacy = serde_json::to_value(&workspace).unwrap();
-        for entry in legacy["entries"].as_array_mut().unwrap() {
-            entry.as_object_mut().unwrap().remove("request");
-        }
-        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        assert!(
-            Workspace::load(&path)
-                .unwrap()
-                .entry(request)
-                .unwrap()
-                .request
-                .params
-                .is_empty()
-        );
-        fs::write(&path, b"invalid json").unwrap();
-        assert!(Workspace::load(&path).is_err());
-        fs::remove_file(path).unwrap();
     }
 }
