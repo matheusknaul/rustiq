@@ -3485,6 +3485,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "time",
  "uuid",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
@@ -3496,6 +3497,7 @@ name = "rustiq-http"
 version = "0.1.0"
 dependencies = [
  "cookie",
+ "http-body-util",
  "reqwest",
  "rustiq-core",
  "serde",

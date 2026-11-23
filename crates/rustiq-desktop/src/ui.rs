@@ -5,6 +5,7 @@ use iced::{
 };
 
 // Font Awesome Free glyphs, bundled so icons render without system fonts.
+pub const HISTORY: char = '\u{f1da}';
 pub const LOCK: char = '\u{f023}';
 pub const COPY: char = '\u{f0c5}';
 pub const BOX: char = '\u{f466}';

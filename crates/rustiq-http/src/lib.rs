@@ -1,5 +1,8 @@
 mod options;
+mod payload;
+use http_body_util::BodyExt;
 pub use options::*;
+pub use payload::{PayloadSnapshot, is_cookie_header};
 use reqwest::{
     Client, Method, Url,
     header::{self, HeaderMap, HeaderName, HeaderValue},
@@ -20,6 +23,8 @@ pub struct ResponseCookie {
 }
 #[derive(Default, Clone)]
 pub struct HttpResponse {
+    pub request_payload: Option<PayloadSnapshot>,
+    pub sent_at: u64,
     pub status: u16,
     pub body: String,
     pub headers: Vec<(String, String)>,
@@ -228,7 +233,34 @@ pub async fn send_request_with_options(
     } else {
         None
     };
-    let request = build_request(&client, url, method, &options, token.as_deref())?;
+    let mut request = build_request(&client, url, method, &options, token.as_deref())?;
+    // Multipart bodies are streams. Materialize the existing text-only body once
+    // so the snapshot uses the same encoded bytes and boundary as the sent body.
+    let body = if let Some(body) = request.body_mut().take() {
+        let bytes = body
+            .collect()
+            .await
+            .map_err(|_| "Could not prepare request body")?
+            .to_bytes();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        *request.body_mut() = Some(reqwest::Body::from(bytes));
+        text
+    } else {
+        String::new()
+    };
+    let request_payload = PayloadSnapshot::new(
+        body,
+        request.headers().iter().map(|(name, value)| {
+            (
+                name.to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        }),
+    );
+    let sent_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let started = Instant::now();
     let response = client
         .execute(request)
@@ -286,6 +318,8 @@ pub async fn send_request_with_options(
         .await
         .map_err(|e| e.without_url().to_string())?;
     Ok(HttpResponse {
+        request_payload: Some(request_payload),
+        sent_at,
         status,
         body: String::from_utf8_lossy(&bytes).into_owned(),
         headers,
