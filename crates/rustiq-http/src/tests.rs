@@ -300,10 +300,11 @@ async fn multipart_fields_are_sent_with_the_matching_boundary() {
     let mut options = RequestOptions::default();
     options.body.kind = BodyKind::Multipart;
     options.body.fields = vec![pair("field", "hello multipart")];
-    send_request_with_options(&url, Method::POST, options)
+    let result = send_request_with_options(&url, Method::POST, options)
         .await
         .unwrap();
     let raw = handle.join().unwrap();
+    assert!(raw.ends_with(&result.request_payload.as_ref().unwrap().body));
     let boundary = raw
         .lines()
         .find_map(|l| l.strip_prefix("content-type: multipart/form-data; boundary="))
@@ -324,4 +325,43 @@ fn secret_values_are_not_exposed_by_debug_output() {
         ..Default::default()
     };
     assert!(!format!("{response:?}").contains("response-secret"));
+}
+
+#[tokio::test]
+async fn snapshot_captures_prepared_body_and_auth_but_excludes_cookie_headers() {
+    let (url, handle) = server(reply("received"));
+    let mut options = RequestOptions::default();
+    options.body.kind = BodyKind::Json;
+    options.body.text = "{\"sent\":true}".into();
+    options.auth.kind = AuthKind::Bearer;
+    options.auth.token = "actual-token".into();
+    options.cookies = vec![pair("session", "do-not-record")];
+    let result = send_request_with_options(&url, Method::POST, options)
+        .await
+        .unwrap();
+    let snapshot = result.request_payload.as_ref().unwrap();
+    assert_eq!(snapshot.body, "{\"sent\":true}");
+    assert!(
+        snapshot
+            .headers
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer actual-token")
+    );
+    assert!(
+        snapshot
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v == "application/json")
+    );
+    assert!(!snapshot.headers.iter().any(|(k, _)| is_cookie_header(k)));
+    assert!(handle.join().unwrap().contains("session=do-not-record"));
+    let mut snapshot = snapshot.clone();
+    snapshot
+        .headers
+        .push(("Set-Cookie".into(), "excluded-even-if-injected".into()));
+    assert!(
+        !serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("excluded-even-if-injected")
+    );
 }

@@ -1,0 +1,45 @@
+
+name: RustiQ Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build RustiQ
+        run: cargo build --release --locked -p rustiq-desktop --bin rustiq-desktop
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "target/release/rustiq-desktop.exe"
+
+          if (-not (Test-Path $asset)) {
+            throw "Executavel nao encontrado: $asset"
+          }
+
+          gh release create $env:GITHUB_REF_NAME $asset `
+            --title "RustiQ $env:GITHUB_REF_NAME" `
+            --generate-notes
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao publicar a release"
+          }

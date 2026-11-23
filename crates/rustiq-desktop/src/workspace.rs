@@ -31,6 +31,8 @@ pub struct Entry {
     pub request: rustiq_http::RequestOptions,
     #[serde(default)]
     pub persistence: Persistence,
+    #[serde(default)]
+    pub history: Vec<crate::history::Exchange>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -84,6 +86,7 @@ impl Workspace {
             expanded: true,
             request: rustiq_http::RequestOptions::default(),
             persistence: Persistence::Encrypted,
+            history: Vec::new(),
         });
         Some(id)
     }

@@ -19,7 +19,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const SERVICE: &str = "io.rustiq.desktop.workspace-key";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const KEYCHAIN_ERROR: &str = "OS credential store unavailable or locked. Unlock your keychain and retry. Nothing was saved in plaintext.";
 
@@ -96,6 +96,8 @@ struct Document {
 struct RequestData {
     url: String,
     request: rustiq_http::RequestOptions,
+    #[serde(default)]
+    history: Vec<crate::history::Exchange>,
 }
 
 // Probe only the document shape, without allocating plaintext secret strings.
@@ -116,6 +118,7 @@ fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D:
 struct RequestDataRef<'a> {
     url: &'a str,
     request: &'a rustiq_http::RequestOptions,
+    history: &'a [crate::history::Exchange],
 }
 fn cleanup_legacy_temporary(path: &Path) -> Result<(), String> {
     let old_temporary = path.with_extension("json.tmp");
@@ -231,7 +234,7 @@ impl<K: KeyStore> Storage<K> {
         if probe.header || probe.ciphertext {
             let document: Document =
                 serde_json::from_slice(&bytes).map_err(|_| "Invalid encrypted workspace format")?;
-            if document.header.version != VERSION
+            if !matches!(document.header.version, 2 | VERSION)
                 || document.header.format != "rustiq-encrypted-workspace"
             {
                 return Err(
@@ -272,6 +275,7 @@ impl<K: KeyStore> Storage<K> {
                         Persistence::SessionOnly => RequestData {
                             url: String::new(),
                             request: Default::default(),
+                            history: Vec::new(),
                         },
                     };
                     Ok(Entry {
@@ -284,17 +288,24 @@ impl<K: KeyStore> Storage<K> {
                         persistence: meta.persistence,
                         url: data.url,
                         request: data.request,
+                        history: data.history,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             if !requests.is_empty() {
                 return Err("Encrypted workspace contains unknown requests".into());
             }
-            let workspace = Workspace {
+            let mut workspace = Workspace {
                 entries,
                 next_id: document.header.next_id,
             };
             workspace.validate()?;
+            for entry in &mut workspace.entries {
+                for exchange in &mut entry.history {
+                    exchange.sanitize();
+                }
+            }
+            crate::history::enforce_limits(&mut workspace);
             cleanup_legacy_temporary(&storage.path)?;
             Ok((storage, workspace))
         } else {
@@ -303,9 +314,15 @@ impl<K: KeyStore> Storage<K> {
             if !probe.entries {
                 return Err("Unrecognized legacy workspace format".into());
             }
-            let workspace: Workspace = serde_json::from_slice(&bytes)
+            let mut workspace: Workspace = serde_json::from_slice(&bytes)
                 .map_err(|_| "Invalid legacy workspace; original file preserved")?;
             workspace.validate()?;
+            for entry in &mut workspace.entries {
+                for exchange in &mut entry.history {
+                    exchange.sanitize();
+                }
+            }
+            crate::history::enforce_limits(&mut workspace);
             drop(guard);
             storage.save(&workspace)?;
             // The old writer used this deterministic filename. Remove it only after
@@ -391,6 +408,7 @@ impl<K: KeyStore> Storage<K> {
                     RequestDataRef {
                         url: &e.url,
                         request: &e.request,
+                        history: &e.history,
                     },
                 )
             })
@@ -775,6 +793,82 @@ mod tests {
         let (_, loaded) = Storage::open(path.clone(), store).unwrap();
         assert!(loaded.entry(2).is_none());
         secrets_absent(&path);
+    }
+    #[test]
+    fn history_round_trip_is_encrypted_clearable_and_respects_session_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.json");
+        let store = FakeKeyStore::default();
+        let (mut storage, _) = Storage::open(path.clone(), store.clone()).unwrap();
+        let mut workspace = workspace();
+        crate::history::record(&mut workspace, 2, &crate::history::tests::response()).unwrap();
+        storage.save(&workspace).unwrap();
+        let bytes = file(&path);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("response-secret"));
+        assert!(!text.contains("original-request"));
+        let (mut reopened, mut loaded) = Storage::open(path.clone(), store.clone()).unwrap();
+        let history = &loaded.entry(2).unwrap().history;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].response.body, "response-secret");
+        assert_eq!(history[0].request.body, "original-request");
+        assert_eq!(history[0].response.headers.len(), 1);
+        assert_eq!(history[0].request.headers.len(), 1);
+        loaded.entry_mut(2).unwrap().history.clear();
+        reopened.save(&loaded).unwrap();
+        let (mut reopened, mut loaded) = Storage::open(path.clone(), store.clone()).unwrap();
+        assert!(loaded.entry(2).unwrap().history.is_empty());
+        crate::history::record(&mut loaded, 2, &crate::history::tests::response()).unwrap();
+        loaded.entry_mut(2).unwrap().persistence = Persistence::SessionOnly;
+        reopened.save(&loaded).unwrap();
+        let (_, loaded) = Storage::open(path, store).unwrap();
+        assert!(loaded.entry(2).unwrap().history.is_empty());
+    }
+
+    #[test]
+    fn encrypted_v2_snapshots_without_history_remain_readable_and_upgrade_on_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.json");
+        let store = FakeKeyStore::default();
+        let (mut storage, _) = Storage::open(path.clone(), store.clone()).unwrap();
+        storage.save(&workspace()).unwrap();
+        let mut document: Document = serde_json::from_slice(&file(&path)).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(storage.key.as_ref().unwrap()).unwrap();
+        let old_nonce: [u8; 12] = BASE64.decode(&document.nonce).unwrap().try_into().unwrap();
+        let data = cipher
+            .decrypt(
+                &Nonce::from(old_nonce),
+                Payload {
+                    msg: &BASE64.decode(&document.ciphertext).unwrap(),
+                    aad: &serde_json::to_vec(&document.header).unwrap(),
+                },
+            )
+            .unwrap();
+        let mut data: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        for request in data.as_object_mut().unwrap().values_mut() {
+            request.as_object_mut().unwrap().remove("history");
+        }
+        document.header.version = 2;
+        let nonce = Nonce::generate();
+        document.nonce = BASE64.encode(nonce);
+        document.ciphertext = BASE64.encode(
+            cipher
+                .encrypt(
+                    &nonce,
+                    Payload {
+                        msg: &serde_json::to_vec(&data).unwrap(),
+                        aad: &serde_json::to_vec(&document.header).unwrap(),
+                    },
+                )
+                .unwrap(),
+        );
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let (mut reopened, loaded) = Storage::open(path.clone(), store).unwrap();
+        assert_eq!(loaded.entry(2).unwrap().request.auth.token, "bearer-secret");
+        assert!(loaded.entry(2).unwrap().history.is_empty());
+        reopened.save(&loaded).unwrap();
+        let updated: Document = serde_json::from_slice(&file(&path)).unwrap();
+        assert_eq!(updated.header.version, VERSION);
     }
 }
 

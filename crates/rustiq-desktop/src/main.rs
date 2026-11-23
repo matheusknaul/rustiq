@@ -1,5 +1,7 @@
 mod app;
 mod details;
+mod history;
+mod history_view;
 mod message;
 mod storage;
 mod theme;

@@ -4,6 +4,7 @@ use rustiq_http::HttpResponse;
 
 #[derive(Clone)]
 pub enum Message {
+    History(crate::history_view::Action),
     LockWorkspace,
     ConfirmLock,
     RetryStorage,
@@ -28,6 +29,7 @@ impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Iced debug tools must never print input or response values.
         f.write_str(match self {
+            Self::History(_) => "History(<redacted>)",
             Self::LockWorkspace => "LockWorkspace",
             Self::ConfirmLock => "ConfirmLock",
             Self::RetryStorage => "RetryStorage",

@@ -1,4 +1,5 @@
 use crate::details::{Details, Response};
+use crate::history_view::HistoryView;
 use crate::storage::{NativeKeyStore, Storage, workspace_path};
 use crate::{
     message::Message,
@@ -27,6 +28,7 @@ enum Dialog {
 pub struct App {
     workspace: Workspace,
     details: Details,
+    history: HistoryView,
     selected: Option<Id>,
     responses: HashMap<Id, Response>,
     pending: HashMap<Id, iced::task::Handle>,
@@ -51,6 +53,7 @@ impl Default for App {
         Self {
             workspace,
             details: Details::default(),
+            history: HistoryView::default(),
             selected: None,
             responses: HashMap::new(),
             pending: HashMap::new(),
@@ -81,6 +84,15 @@ impl App {
             return Task::none();
         }
         match message {
+            Message::History(action) => {
+                if let Some(entry) = self.selected.and_then(|id| self.workspace.entry_mut(id)) {
+                    let (task, changed) = self.history.update(action, entry);
+                    if changed {
+                        self.persist();
+                    }
+                    return task;
+                }
+            }
             Message::LockWorkspace => {
                 if !self.temporary && self.storage_error.is_none() {
                     self.dialog = Some(Dialog::LockWorkspace);
@@ -94,6 +106,7 @@ impl App {
                     self.pending.clear();
                     self.workspace = Workspace::default();
                     self.details = Details::default();
+                    self.history.reset();
                     self.responses.clear();
                     self.selected = None;
                     self.dialog = None;
@@ -144,6 +157,7 @@ impl App {
                 }
             }
             Message::Select(id) => {
+                self.history.reset();
                 self.selected = Some(id);
                 self.details.select(self.workspace.entry(id));
             }
@@ -212,6 +226,7 @@ impl App {
                         if let Some(id) = id {
                             self.workspace.rename(id, &value);
                         } else {
+                            self.history.reset();
                             self.selected = self.workspace.create(kind, parent, &value);
                             self.details
                                 .select(self.selected.and_then(|id| self.workspace.entry(id)));
@@ -238,6 +253,7 @@ impl App {
                         }
                     });
                     self.selected = None;
+                    self.history.reset();
                     self.persist();
                 }
             }
@@ -283,8 +299,24 @@ impl App {
             Message::RequestFinished(id, result) => {
                 self.pending.remove(&id);
                 if self.workspace.entry(id).is_some() {
+                    let mut recorded = false;
+                    if let Ok(data) = &result {
+                        match crate::history::record(&mut self.workspace, id, data) {
+                            Ok(saved) => recorded = saved,
+                            Err(notice) => self.details.notice = Some(notice.into()),
+                        }
+                    }
+                    if let Some(entry) = self
+                        .selected
+                        .and_then(|selected| self.workspace.entry(selected))
+                    {
+                        self.history.sync(entry);
+                    }
                     let response = self.responses.entry(id).or_default();
                     response.complete(result);
+                    if recorded {
+                        self.persist();
+                    }
                 }
             }
         }
@@ -453,6 +485,19 @@ impl App {
             content = content.push(text("SESSION ONLY — nothing in this workspace will be saved. Restart to reopen your saved workspace.").size(11).color(theme::YELLOW));
         }
         if let Some(entry) = self.selected.and_then(|id| self.workspace.entry(id)) {
+            let history_button: Element<'_, Message> = if entry.kind == Kind::Request {
+                button(ui::label(
+                    ui::HISTORY,
+                    format!("History ({})", entry.history.len()),
+                    theme::BLUE,
+                ))
+                .padding([8, 10])
+                .on_press(Message::History(crate::history_view::Action::Toggle))
+                .style(theme::control)
+                .into()
+            } else {
+                iced::widget::Space::new().into()
+            };
             content = content
                 .push(
                     text(format!("~/{}", self.breadcrumb(entry.id)))
@@ -471,6 +516,7 @@ impl App {
                         ),
                         text(&entry.name).size(22),
                         iced::widget::Space::new().width(Fill),
+                        history_button,
                         button(ui::label(ui::EDIT, "Rename", theme::BLUE))
                             .padding([8, 10])
                             .on_press(Message::Rename)
@@ -484,68 +530,72 @@ impl App {
                     .align_y(iced::Center),
                 );
             if entry.kind == Kind::Request {
-                let response = self.responses.get(&entry.id);
-                let loading = response.is_some_and(|r| r.loading);
-                let mut send = button(ui::label(
-                    ui::ROCKET,
-                    if loading { "Sending..." } else { "Send" },
-                    theme::MANTLE,
-                ))
-                .padding([12, 16])
-                .style(theme::primary);
-                if !loading && !entry.url.trim().is_empty() {
-                    send = send.on_press(Message::SendRequest);
-                }
-                content = content.push(
-                    container(
-                        column![
-                            text("REQUEST").size(11).color(theme::BLUE),
-                            row![
-                                pick_list(
-                                    [
-                                        Method::GET,
-                                        Method::POST,
-                                        Method::PUT,
-                                        Method::PATCH,
-                                        Method::DELETE,
-                                        Method::HEAD,
-                                        Method::OPTIONS
-                                    ],
-                                    Some(entry.method.parse().unwrap_or(Method::GET)),
-                                    Message::MethodChanged
-                                )
-                                .text_size(13)
-                                .padding(12),
-                                text_input("https://api.example.com", &entry.url)
-                                    .on_input(Message::UrlChanged)
-                                    .on_submit(Message::SendRequest)
-                                    .size(13)
-                                    .padding(12)
-                                    .style(theme::input)
-                                    .width(Fill),
-                                send
+                if self.history.open {
+                    content = content.push(self.history.view(entry));
+                } else {
+                    let response = self.responses.get(&entry.id);
+                    let loading = response.is_some_and(|r| r.loading);
+                    let mut send = button(ui::label(
+                        ui::ROCKET,
+                        if loading { "Sending..." } else { "Send" },
+                        theme::MANTLE,
+                    ))
+                    .padding([12, 16])
+                    .style(theme::primary);
+                    if !loading && !entry.url.trim().is_empty() {
+                        send = send.on_press(Message::SendRequest);
+                    }
+                    content = content.push(
+                        container(
+                            column![
+                                text("REQUEST").size(11).color(theme::BLUE),
+                                row![
+                                    pick_list(
+                                        [
+                                            Method::GET,
+                                            Method::POST,
+                                            Method::PUT,
+                                            Method::PATCH,
+                                            Method::DELETE,
+                                            Method::HEAD,
+                                            Method::OPTIONS
+                                        ],
+                                        Some(entry.method.parse().unwrap_or(Method::GET)),
+                                        Message::MethodChanged
+                                    )
+                                    .text_size(13)
+                                    .padding(12),
+                                    text_input("https://api.example.com", &entry.url)
+                                        .on_input(Message::UrlChanged)
+                                        .on_submit(Message::SendRequest)
+                                        .size(13)
+                                        .padding(12)
+                                        .style(theme::input)
+                                        .width(Fill),
+                                    send
+                                ]
+                                .spacing(8)
+                                .align_y(iced::Center)
                             ]
-                            .spacing(8)
-                            .align_y(iced::Center)
-                        ]
-                        .spacing(12),
-                    )
-                    .padding(16)
-                    .width(Fill)
-                    .style(theme::panel),
-                );
-
-                content = content
-                    .push(
-                        container(self.details.request_view(entry, self.temporary))
-                            .height(iced::Length::FillPortion(1)),
-                    )
-                    .push(
-                        container(self.details.response_view(response))
-                            .height(iced::Length::FillPortion(1)),
+                            .spacing(12),
+                        )
+                        .padding(16)
+                        .width(Fill)
+                        .style(theme::panel),
                     );
-                if let Some(notice) = &self.details.notice {
-                    content = content.push(text(notice).size(11).color(theme::YELLOW));
+
+                    content = content
+                        .push(
+                            container(self.details.request_view(entry, self.temporary))
+                                .height(iced::Length::FillPortion(1)),
+                        )
+                        .push(
+                            container(self.details.response_view(response))
+                                .height(iced::Length::FillPortion(1)),
+                        );
+                    if let Some(notice) = &self.details.notice {
+                        content = content.push(text(notice).size(11).color(theme::YELLOW));
+                    }
                 }
             } else {
                 let children: Vec<_> = self
@@ -844,6 +894,7 @@ mod tests {
         App {
             workspace: Workspace::default(),
             details: Details::default(),
+            history: HistoryView::default(),
             selected: None,
             responses: HashMap::new(),
             pending: HashMap::new(),
@@ -895,6 +946,40 @@ mod tests {
     }
 
     #[test]
+    fn historical_payloads_stay_with_the_sent_request_and_ignore_drafts_and_errors() {
+        let mut app = session_app();
+        let collection = app.workspace.create(Kind::Collection, None, "API").unwrap();
+        let first = app
+            .workspace
+            .create(Kind::Request, Some(collection), "First")
+            .unwrap();
+        let second = app
+            .workspace
+            .create(Kind::Request, Some(collection), "Second")
+            .unwrap();
+        app.workspace.entry_mut(first).unwrap().request.body.text = "edited while sending".into();
+        let _ = app.update(Message::Select(second));
+        let _ = app.update(Message::RequestFinished(
+            first,
+            Ok(crate::history::tests::response()),
+        ));
+        assert_eq!(
+            app.workspace.entry(first).unwrap().history[0].request.body,
+            "original-request"
+        );
+        assert!(app.workspace.entry(second).unwrap().history.is_empty());
+        assert_eq!(
+            app.workspace.entry(first).unwrap().request.body.text,
+            "edited while sending"
+        );
+        let _ = app.update(Message::RequestFinished(
+            first,
+            Err("connection failed".into()),
+        ));
+        assert_eq!(app.workspace.entry(first).unwrap().history.len(), 1);
+    }
+
+    #[test]
     fn edits_and_async_responses_stay_with_their_request() {
         let mut workspace = Workspace::default();
         let collection = workspace.create(Kind::Collection, None, "API").unwrap();
@@ -907,6 +992,7 @@ mod tests {
         let mut app = App {
             workspace,
             details: Details::default(),
+            history: HistoryView::default(),
             selected: Some(first),
             responses: HashMap::new(),
             pending: HashMap::new(),

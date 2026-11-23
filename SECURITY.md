@@ -2,15 +2,41 @@
 
 ## O que é protegido
 
-O `workspace.json` usa o formato versionado `rustiq-encrypted-workspace` (v2).
+O `workspace.json` usa o formato versionado `rustiq-encrypted-workspace` (v3). O formato v2 continua legível e é atualizado
+na próxima gravação.
 Nomes de coleções, pastas e requests, IDs, hierarquia, métodos HTTP e preferências
 visuais permanecem legíveis. Não coloque credenciais nos nomes dos itens.
 
 URLs e toda a configuração de cada request são criptografadas: parâmetros,
 headers, cookies configurados, autenticação e body, incluindo campos desativados.
 A proteção abrange campos arbitrários; não depende de reconhecer nomes como
-`Authorization` ou `password`. Respostas e cookies recebidos continuam somente
-na memória.
+`Authorization` ou `password`. O histórico persiste somente os bodies e headers
+da request preparada e da resposta recebida, dentro do mesmo conteúdo
+criptografado. `Cookie`, `Set-Cookie`, `Cookie2` e `Set-Cookie2` são excluídos do
+histórico, independentemente de maiúsculas/minúsculas. Os cookies capturados
+continuam somente na memória; a configuração de cookies da request mantém a
+proteção criptografada já existente.
+
+O histórico é associado à request e contém data UTC, status, duração e tamanho
+para identificar cada troca. Não guarda URLs ou cópias completas de auth/params
+em cada registro. Headers de autenticação que efetivamente fazem parte da
+request preparada são mantidos criptografados. Headers de transporte que o
+cliente HTTP adiciona depois da preparação podem não aparecer no snapshot.
+Corpos são preservados como texto, como no editor de resposta existente. Se o
+servidor escrever dados de cookies dentro do body, esse conteúdo faz parte do
+body e não é removido automaticamente.
+
+São registrados apenas envios que receberam uma resposta HTTP completa,
+incluindo 4xx/5xx. Falhas de conexão e envios cancelados não criam um par
+request/response. Cada snapshot é independente do draft atual: editar a request
+durante o envio ou usar prettify no histórico não muda o que foi registrado.
+
+O botão **History** abre a consulta lado a lado dos bodies e headers, com cópia,
+prettify JSON e retorno ao texto original. **Clear history** exige confirmação
+e remove os registros dessa request na próxima gravação bem-sucedida.
+A retenção é de até 100 trocas por request e 8 MiB de payloads por workspace,
+removendo os registros mais antigos. Uma troca acima de 2 MiB é ignorada com
+aviso, sem truncar o payload ou impedir a exibição da resposta atual.
 
 A criptografia é AES-256-GCM, com nonce aleatório de 96 bits em cada gravação.
 Os metadados também são autenticados como dados associados (AAD). Alterações no
@@ -43,17 +69,19 @@ uma garantia de apagamento de todas as cópias existentes em memória ou swap.
 
 Desmarque **Save request configuration encrypted** para excluir a configuração
 da request da próxima gravação. A estrutura e o nome do item permanecem; URL e
-campos são descartados ao fechar ou bloquear o workspace. A alteração só é
+campos e histórico são descartados ao fechar ou bloquear o workspace. A alteração só é
 persistida quando a gravação conclui; um erro é mostrado se isso falhar.
 
 Se o cofre não estiver disponível, é possível tentar novamente ou abrir um
-**temporary workspace**. Nesse modo nada é persistido e o arquivo existente não
+**temporary workspace**. Nesse modo nada é persistido, incluindo o histórico, e o arquivo existente não
 é alterado. Reinicie o aplicativo para voltar ao workspace salvo.
 
 ## Migração e gravação
 
 Encerre versões antigas do RustiQ antes de migrar: elas não conhecem o novo
-formato nem o protocolo de lock.
+formato nem o protocolo de lock. A versão v3 não pode ser aberta por versões
+que aceitam somente o formato v2; elas recusam a abertura sem sobrescrever o
+arquivo.
 
 O JSON antigo é migrado automaticamente na primeira abertura bem-sucedida. A
 migração valida o conteúdo e confirma a chave no SO antes de substituir o
